@@ -20,11 +20,14 @@ import com.bizhil.springbootinit.service.UserService;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
@@ -41,6 +44,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
     @Resource
     private UserMapper userMapper;
+
+    @Resource
+    private RedissonClient redissonClient;
 
     /**
      * 盐值，混淆密码
@@ -99,22 +105,51 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (userPassword.length() < 8) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "密码错误");
         }
+
+        RLock lock = redissonClient.getLock("user-login-lock:" + userAccount);
         // 2. 加密
         String encryptPassword = DigestUtils.md5DigestAsHex((SALT + userPassword).getBytes());
-        // 查询用户是否存在
-        QueryWrapper<User> queryWrapper = new QueryWrapper<>();
-        queryWrapper.eq("userAccount", userAccount);
-        queryWrapper.eq("userPassword", encryptPassword);
-        User user = this.baseMapper.selectOne(queryWrapper);
-        // 用户不存在
-        if (user == null) {
-            log.info("user login failed, userAccount cannot match userPassword");
-            throw new BusinessException(ErrorCode.PARAMS_ERROR, "用户不存在或密码错误");
-        }
-        // 3. 记录用户的登录态
-        request.getSession().setAttribute(USER_LOGIN_STATE, user);
 
-        return this.getLoginUserVO(user);
+        try {
+            // 尝试获取锁，等待时间为 2 秒
+            if (lock.tryLock(1, 2, TimeUnit.SECONDS)) {
+                // 检查用户是否已登录
+                String key = "user-login-status:" + userAccount;
+                Boolean isLogged = (Boolean) redissonClient.getBucket(key).get();
+
+                if (isLogged != null && isLogged) {
+                    // 用户已登录，拒绝新的登录请求
+                    throw new BusinessException(ErrorCode.PARAMS_ERROR, "用户已在其他设备登录，请先登出后再试");
+                }
+                // 查询用户是否存在
+                QueryWrapper<User> queryWrapper = new QueryWrapper<>();
+                queryWrapper.eq("userAccount", userAccount);
+                queryWrapper.eq("userPassword", encryptPassword);
+                User user = this.baseMapper.selectOne(queryWrapper);
+                // 用户不存在
+                if (user == null) {
+                    log.info("user login failed, userAccount cannot match userPassword");
+                    throw new BusinessException(ErrorCode.PARAMS_ERROR, "用户不存在或密码错误");
+                }
+
+                // 记录用户的登录状态
+                redissonClient.getBucket(key).set(true);
+                // 记录用户的session登录态
+                request.getSession().setAttribute(USER_LOGIN_STATE, user);
+
+                return getLoginUserVO(user);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "登录失败，请稍后重试");
+        } finally {
+            // 释放自己的锁
+            if (lock.isHeldByCurrentThread()){
+                lock.unlock();
+            }
+        }
+        // 如果没有获取到锁，这里不会执行到
+        throw new BusinessException(ErrorCode.SYSTEM_ERROR, "登录失败，请稍后重试");
     }
 
 
@@ -191,7 +226,17 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (request.getSession().getAttribute(USER_LOGIN_STATE) == null) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "未登录");
         }
+
+        // 获取用户的登录状态键
+        Object userLoginState = request.getSession().getAttribute(USER_LOGIN_STATE);
+        if (!(userLoginState instanceof User)) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "登录状态无效");
+        }
+        User user = (User) userLoginState;
+        String key = "user-login-status:" + user.getUserAccount();
+
         // 移除登录态
+        redissonClient.getBucket(key).delete();
         request.getSession().removeAttribute(USER_LOGIN_STATE);
         return true;
     }
